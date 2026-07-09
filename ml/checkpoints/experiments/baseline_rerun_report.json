@@ -1,0 +1,68 @@
+{
+  "tag": "baseline_rerun",
+  "train_x_path": "data/processed/X_train.npy",
+  "train_samples": 121078,
+  "best_epoch": 21,
+  "best_val_f1": 0.8168,
+  "test_accuracy": 0.935,
+  "test_macro_f1": 0.824,
+  "test_weighted_f1": 0.9431,
+  "per_class": {
+    "none": {
+      "precision": 0.9985,
+      "recall": 0.9328,
+      "f1": 0.9646,
+      "support": 14728
+    },
+    "Center": {
+      "precision": 0.8563,
+      "recall": 0.9698,
+      "f1": 0.9095,
+      "support": 430
+    },
+    "Donut": {
+      "precision": 0.8615,
+      "recall": 1.0,
+      "f1": 0.9256,
+      "support": 56
+    },
+    "Edge-Loc": {
+      "precision": 0.465,
+      "recall": 0.9094,
+      "f1": 0.6154,
+      "support": 519
+    },
+    "Edge-Ring": {
+      "precision": 0.9229,
+      "recall": 0.9897,
+      "f1": 0.9551,
+      "support": 968
+    },
+    "Loc": {
+      "precision": 0.5756,
+      "recall": 0.8802,
+      "f1": 0.696,
+      "support": 359
+    },
+    "Near-full": {
+      "precision": 0.9333,
+      "recall": 0.9333,
+      "f1": 0.9333,
+      "support": 15
+    },
+    "Random": {
+      "precision": 0.7745,
+      "recall": 0.908,
+      "f1": 0.836,
+      "support": 87
+    },
+    "Scratch": {
+      "precision": 0.4286,
+      "recall": 0.9,
+      "f1": 0.5806,
+      "support": 120
+    }
+  },
+  "total_time_s": 2505.4,
+  "checkpoint": "/home/geonyoung_lee/fab_scope/ml/checkpoints/experiments/baseline_rerun.pt"
+}

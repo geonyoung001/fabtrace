@@ -1,0 +1,68 @@
+{
+  "tag": "oversample_naive",
+  "train_x_path": "data/processed/experiments/X_train_oversample_naive.npy",
+  "train_samples": 122405,
+  "best_epoch": 11,
+  "best_val_f1": 0.8257,
+  "test_accuracy": 0.9453,
+  "test_macro_f1": 0.8243,
+  "test_weighted_f1": 0.9527,
+  "per_class": {
+    "none": {
+      "precision": 0.9965,
+      "recall": 0.9491,
+      "f1": 0.9722,
+      "support": 14728
+    },
+    "Center": {
+      "precision": 0.8921,
+      "recall": 0.9233,
+      "f1": 0.9074,
+      "support": 430
+    },
+    "Donut": {
+      "precision": 0.9259,
+      "recall": 0.8929,
+      "f1": 0.9091,
+      "support": 56
+    },
+    "Edge-Loc": {
+      "precision": 0.5539,
+      "recall": 0.9114,
+      "f1": 0.689,
+      "support": 519
+    },
+    "Edge-Ring": {
+      "precision": 0.9425,
+      "recall": 0.9824,
+      "f1": 0.9621,
+      "support": 968
+    },
+    "Loc": {
+      "precision": 0.7385,
+      "recall": 0.8022,
+      "f1": 0.769,
+      "support": 359
+    },
+    "Near-full": {
+      "precision": 0.9333,
+      "recall": 0.9333,
+      "f1": 0.9333,
+      "support": 15
+    },
+    "Random": {
+      "precision": 0.8506,
+      "recall": 0.8506,
+      "f1": 0.8506,
+      "support": 87
+    },
+    "Scratch": {
+      "precision": 0.2768,
+      "recall": 0.925,
+      "f1": 0.4261,
+      "support": 120
+    }
+  },
+  "total_time_s": 1716.5,
+  "checkpoint": "/home/geonyoung_lee/fab_scope/ml/checkpoints/experiments/oversample_naive.pt"
+}

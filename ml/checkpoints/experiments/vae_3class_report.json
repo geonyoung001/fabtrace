@@ -1,0 +1,68 @@
+{
+  "tag": "vae_3class",
+  "train_x_path": "data/processed/experiments/X_train_vae_3class.npy",
+  "train_samples": 122405,
+  "best_epoch": 19,
+  "best_val_f1": 0.8182,
+  "test_accuracy": 0.9347,
+  "test_macro_f1": 0.8197,
+  "test_weighted_f1": 0.9426,
+  "per_class": {
+    "none": {
+      "precision": 0.9977,
+      "recall": 0.9352,
+      "f1": 0.9654,
+      "support": 14728
+    },
+    "Center": {
+      "precision": 0.7652,
+      "recall": 0.9628,
+      "f1": 0.8527,
+      "support": 430
+    },
+    "Donut": {
+      "precision": 0.9615,
+      "recall": 0.8929,
+      "f1": 0.9259,
+      "support": 56
+    },
+    "Edge-Loc": {
+      "precision": 0.474,
+      "recall": 0.9133,
+      "f1": 0.6241,
+      "support": 519
+    },
+    "Edge-Ring": {
+      "precision": 0.9512,
+      "recall": 0.9659,
+      "f1": 0.9585,
+      "support": 968
+    },
+    "Loc": {
+      "precision": 0.5347,
+      "recall": 0.8802,
+      "f1": 0.6653,
+      "support": 359
+    },
+    "Near-full": {
+      "precision": 0.9333,
+      "recall": 0.9333,
+      "f1": 0.9333,
+      "support": 15
+    },
+    "Random": {
+      "precision": 0.7624,
+      "recall": 0.8851,
+      "f1": 0.8191,
+      "support": 87
+    },
+    "Scratch": {
+      "precision": 0.513,
+      "recall": 0.825,
+      "f1": 0.6326,
+      "support": 120
+    }
+  },
+  "total_time_s": 2369.3,
+  "checkpoint": "/home/geonyoung_lee/fab_scope/ml/checkpoints/experiments/vae_3class.pt"
+}

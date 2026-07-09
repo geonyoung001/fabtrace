@@ -1,0 +1,70 @@
+{
+  "tag": "no_alpha_seed123",
+  "train_x_path": "data/processed/X_train.npy",
+  "train_samples": 121078,
+  "alpha_mode": "none",
+  "gamma": 2.0,
+  "best_epoch": 41,
+  "best_val_f1": 0.9092,
+  "test_accuracy": 0.9811,
+  "test_macro_f1": 0.9108,
+  "test_weighted_f1": 0.981,
+  "per_class": {
+    "none": {
+      "precision": 0.9903,
+      "recall": 0.9935,
+      "f1": 0.9919,
+      "support": 14728
+    },
+    "Center": {
+      "precision": 0.9679,
+      "recall": 0.9116,
+      "f1": 0.9389,
+      "support": 430
+    },
+    "Donut": {
+      "precision": 0.9623,
+      "recall": 0.9107,
+      "f1": 0.9358,
+      "support": 56
+    },
+    "Edge-Loc": {
+      "precision": 0.8891,
+      "recall": 0.8497,
+      "f1": 0.869,
+      "support": 519
+    },
+    "Edge-Ring": {
+      "precision": 0.9695,
+      "recall": 0.9866,
+      "f1": 0.978,
+      "support": 968
+    },
+    "Loc": {
+      "precision": 0.8739,
+      "recall": 0.8106,
+      "f1": 0.841,
+      "support": 359
+    },
+    "Near-full": {
+      "precision": 0.9333,
+      "recall": 0.9333,
+      "f1": 0.9333,
+      "support": 15
+    },
+    "Random": {
+      "precision": 0.9375,
+      "recall": 0.8621,
+      "f1": 0.8982,
+      "support": 87
+    },
+    "Scratch": {
+      "precision": 0.7554,
+      "recall": 0.875,
+      "f1": 0.8108,
+      "support": 120
+    }
+  },
+  "total_time_s": 4051.4,
+  "checkpoint": "/home/geonyoung_lee/fab_scope/ml/checkpoints/experiments/no_alpha_seed123.pt"
+}

@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ML data & model artifacts (large binaries, regenerated from raw data / training scripts)
+# - data/LSWMD.pkl: 2GB raw WM811K dataset
+# - data/processed/*.npy: derived from LSWMD.pkl via notebooks/01_eda.ipynb (100MB+ per file)
+# - ml/checkpoints/**/*.pt: model weights, regenerated via ml/train/train.py or experiment.py
+#   (see ml/EXPERIMENT_RESULTS.md for the winning config + repro command)
+/data/
+/ml/checkpoints/*.pt
+/ml/checkpoints/experiments/*.pt
