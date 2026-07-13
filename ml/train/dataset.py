@@ -4,6 +4,8 @@ import numpy as np
 from skimage.transform import resize as sk_resize
 import torchvision.transforms as T
 
+from ml.config import IMG_SIZE
+
 class WM811KDataset(Dataset):
     def __init__(self, wafer_maps, labels, augment=False):
         # [1] 초기화 — 데이터를 받아 저장
@@ -34,7 +36,7 @@ class WM811KDataset(Dataset):
         y = torch.tensor(self.labels[idx], dtype=torch.long)
         return x, y
 
-    def resize_and_onehot(self, wm, target_size=(64, 64)):
+    def resize_and_onehot(self, wm, target_size=(IMG_SIZE, IMG_SIZE)):
         # nearest-neighbour resize (이산값 0/1/2 보존)
         wm_resized = sk_resize(wm, target_size, order=0,
                             preserve_range=True, anti_aliasing=False).astype(np.int8)

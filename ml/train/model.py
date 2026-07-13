@@ -4,8 +4,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 
+from ml.config import NUM_CLASSES
+
 class WaferClassifier(nn.Module):      # Part 1: 모델
-    def __init__(self, num_classes=9, pretrained=True):
+    def __init__(self, num_classes=NUM_CLASSES, pretrained=True):
         super().__init__()
         self.backbone = models.efficientnet_b0(pretrained=pretrained)
         in_features = self.backbone.classifier[1].in_features

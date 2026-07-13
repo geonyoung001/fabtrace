@@ -1,0 +1,35 @@
+name: "wafer_classifier"
+backend: "onnxruntime"
+
+# max_batch_size > 0 이면 Triton이 첫 축(batch)을 자동으로 붙인다.
+# 따라서 input/output dims 에는 batch 차원을 제외하고 적는다.
+# ONNX 모델의 batch 축은 dynamic("batch_size")이라 서버 배칭과 호환됨.
+max_batch_size: 32
+
+input [
+  {
+    name: "input"
+    data_type: TYPE_FP32
+    dims: [ 3, 64, 64 ]
+  }
+]
+
+output [
+  {
+    name: "logits"
+    data_type: TYPE_FP32
+    dims: [ 9 ]
+  }
+]
+
+# RTX 2060(GPU 0)에서 실행. CPU로 돌리려면 kind 를 KIND_CPU 로 바꾸면 된다.
+instance_group [
+  {
+    kind: KIND_GPU
+    count: 1
+    gpus: [ 0 ]
+  }
+]
+
+# 여러 요청을 서버에서 묶어 처리 (dynamic batch 축 활용)
+dynamic_batching { }

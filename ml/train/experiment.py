@@ -6,7 +6,6 @@ train.py + 02_model_evaluation.ipynb 로직을 하나로 합친 실험용 러너
 """
 import argparse
 import json
-import os
 import time
 
 import numpy as np
@@ -15,12 +14,10 @@ from torch.utils.data import DataLoader
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
-from dataset import WM811KDataset
-from model import WaferClassifier, FocalLoss
-
-PROCESSED_DIR = "/home/geonyoung_lee/fab_scope/data/processed"
-CHECKPOINT_DIR = "/home/geonyoung_lee/fab_scope/ml/checkpoints/experiments"
-FAILURE_CLASSES = ['none', 'Center', 'Donut', 'Edge-Loc', 'Edge-Ring', 'Loc', 'Near-full', 'Random', 'Scratch']
+from ml.config import (EXPERIMENTS_CHECKPOINT_DIR, FAILURE_CLASSES, LABEL_TO_IDX,
+                       NUM_CLASSES, PROCESSED_DATA_DIR)
+from ml.train.dataset import WM811KDataset
+from ml.train.model import WaferClassifier, FocalLoss
 
 
 def run(tag, train_x_path, train_y_path, epochs=50, patience=10, seed=None,
@@ -32,25 +29,23 @@ def run(tag, train_x_path, train_y_path, epochs=50, patience=10, seed=None,
         np.random.seed(seed)
 
     device = torch.device("cuda")
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    ckpt_path = os.path.join(CHECKPOINT_DIR, f"{tag}.pt")
-    log_path = os.path.join(CHECKPOINT_DIR, f"{tag}.log")
-    report_path = os.path.join(CHECKPOINT_DIR, f"{tag}_report.json")
+    EXPERIMENTS_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    ckpt_path = EXPERIMENTS_CHECKPOINT_DIR / f"{tag}.pt"
+    log_path = EXPERIMENTS_CHECKPOINT_DIR / f"{tag}.log"
+    report_path = EXPERIMENTS_CHECKPOINT_DIR / f"{tag}_report.json"
 
     def log(msg):
         print(msg, flush=True)
         with open(log_path, "a") as f:
             f.write(msg + "\n")
 
-    label_to_idx = {label: i for i, label in enumerate(FAILURE_CLASSES)}
-
     train_maps = np.load(train_x_path, allow_pickle=True)
     train_labels_str = np.load(train_y_path, allow_pickle=True)
-    val_maps = np.load(os.path.join(PROCESSED_DIR, "X_val.npy"), allow_pickle=True)
-    val_labels_str = np.load(os.path.join(PROCESSED_DIR, "y_val.npy"), allow_pickle=True)
+    val_maps = np.load(PROCESSED_DATA_DIR / "X_val.npy", allow_pickle=True)
+    val_labels_str = np.load(PROCESSED_DATA_DIR / "y_val.npy", allow_pickle=True)
 
-    train_labels = np.array([label_to_idx[l] for l in train_labels_str])
-    val_labels = np.array([label_to_idx[l] for l in val_labels_str])
+    train_labels = np.array([LABEL_TO_IDX[l] for l in train_labels_str])
+    val_labels = np.array([LABEL_TO_IDX[l] for l in val_labels_str])
 
     log(f"=== {tag} ===")
     log(f"train: {train_x_path} ({len(train_labels)} samples)")
@@ -74,7 +69,7 @@ def run(tag, train_x_path, train_y_path, epochs=50, patience=10, seed=None,
 
     log(f"alpha_mode={alpha_mode} gamma={gamma} alpha={alpha.tolist() if alpha is not None else None}")
 
-    model = WaferClassifier(num_classes=9, pretrained=True).to(device)
+    model = WaferClassifier(num_classes=NUM_CLASSES, pretrained=True).to(device)
     criterion = FocalLoss(alpha=alpha, gamma=gamma)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -110,7 +105,7 @@ def run(tag, train_x_path, train_y_path, epochs=50, patience=10, seed=None,
         avg_val_loss = val_loss / len(val_loader)
         val_acc = accuracy_score(all_labels, all_preds)
         _, _, f1_per_cls, _ = precision_recall_fscore_support(
-            all_labels, all_preds, labels=range(9), zero_division=0)
+            all_labels, all_preds, labels=range(NUM_CLASSES), zero_division=0)
         val_f1 = f1_per_cls.mean()
 
         elapsed = time.time() - t_start
@@ -136,9 +131,9 @@ def run(tag, train_x_path, train_y_path, epochs=50, patience=10, seed=None,
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     model.eval()
 
-    test_maps = np.load(os.path.join(PROCESSED_DIR, "X_test.npy"), allow_pickle=True)
-    test_labels_str = np.load(os.path.join(PROCESSED_DIR, "y_test.npy"), allow_pickle=True)
-    test_labels = np.array([label_to_idx[l] for l in test_labels_str])
+    test_maps = np.load(PROCESSED_DATA_DIR / "X_test.npy", allow_pickle=True)
+    test_labels_str = np.load(PROCESSED_DATA_DIR / "y_test.npy", allow_pickle=True)
+    test_labels = np.array([LABEL_TO_IDX[l] for l in test_labels_str])
     test_ds = WM811KDataset(test_maps, test_labels, augment=False)
     test_loader = DataLoader(test_ds, batch_size=128, shuffle=False, num_workers=4)
 
@@ -151,7 +146,7 @@ def run(tag, train_x_path, train_y_path, epochs=50, patience=10, seed=None,
             y_pred.extend(logits.argmax(1).cpu().numpy())
 
     precision, recall, f1, support = precision_recall_fscore_support(
-        y_true, y_pred, labels=range(9), zero_division=0)
+        y_true, y_pred, labels=range(NUM_CLASSES), zero_division=0)
     test_acc = accuracy_score(y_true, y_pred)
     macro_f1 = f1.mean()
     weighted_f1 = float(np.average(f1, weights=support))
@@ -162,7 +157,7 @@ def run(tag, train_x_path, train_y_path, epochs=50, patience=10, seed=None,
             "recall": round(float(recall[i]), 4),
             "f1": round(float(f1[i]), 4),
             "support": int(support[i]),
-        } for i in range(9)
+        } for i in range(NUM_CLASSES)
     }
 
     result = {
@@ -178,7 +173,7 @@ def run(tag, train_x_path, train_y_path, epochs=50, patience=10, seed=None,
         "test_weighted_f1": round(float(weighted_f1), 4),
         "per_class": per_class,
         "total_time_s": round(time.time() - t_start, 1),
-        "checkpoint": ckpt_path,
+        "checkpoint": str(ckpt_path),
     }
 
     with open(report_path, "w") as f:

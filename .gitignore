@@ -222,6 +222,9 @@ __marimo__/
 # - data/processed/*.npy: derived from LSWMD.pkl via notebooks/01_eda.ipynb (100MB+ per file)
 # - ml/checkpoints/**/*.pt: model weights, regenerated via ml/train/train.py or experiment.py
 #   (see ml/EXPERIMENT_RESULTS.md for the winning config + repro command)
+# - model.onnx: exported from best_model.pt via `python -m ml.export.export_onnx`
+#   (config.pbtxt는 배포 설정이므로 추적한다)
 /data/
 /ml/checkpoints/*.pt
 /ml/checkpoints/experiments/*.pt
+/ml/serving/model_repository/**/*.onnx

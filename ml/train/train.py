@@ -2,28 +2,26 @@ import torch
 from torch.utils.data import DataLoader
 from sklearn.metrics import accuracy_score, f1_score
 import numpy as np
-from dataset import WM811KDataset
-from model import WaferClassifier, FocalLoss
-import os
+
+from ml.config import (BEST_MODEL_PATH, CHECKPOINTS_DIR, LABEL_TO_IDX,
+                       NUM_CLASSES, PROCESSED_DATA_DIR)
+from ml.train.dataset import WM811KDataset
+from ml.train.model import WaferClassifier, FocalLoss
 
 if not torch.cuda.is_available():
     raise RuntimeError("CUDA is not available")
 
 DEVICE = torch.device("cuda")
 
-PREPROCESSED_DATA_DIR = "/home/geonyoung_lee/fab_scope/data/processed"
-
 # AE/VAE 합성 증강(X_train_augmented) 실험 결과 macro F1이 오히려 원본보다 낮았음(~0.82) → 원본 데이터 사용
-train_maps = np.load(os.path.join(PREPROCESSED_DATA_DIR, "X_train.npy"), allow_pickle=True)
-train_labels = np.load(os.path.join(PREPROCESSED_DATA_DIR, "y_train.npy"), allow_pickle=True)
-val_maps = np.load(os.path.join(PREPROCESSED_DATA_DIR, "X_val.npy"), allow_pickle=True)
-val_labels = np.load(os.path.join(PREPROCESSED_DATA_DIR, "y_val.npy"), allow_pickle=True)
+train_maps = np.load(PROCESSED_DATA_DIR / "X_train.npy", allow_pickle=True)
+train_labels = np.load(PROCESSED_DATA_DIR / "y_train.npy", allow_pickle=True)
+val_maps = np.load(PROCESSED_DATA_DIR / "X_val.npy", allow_pickle=True)
+val_labels = np.load(PROCESSED_DATA_DIR / "y_val.npy", allow_pickle=True)
 
-# failureType 문자열 -> 정수 인덱스 (WaferClassifier의 num_classes=9와 순서 일치)
-FAILURE_CLASSES = ['none', 'Center', 'Donut', 'Edge-Loc', 'Edge-Ring', 'Loc', 'Near-full', 'Random', 'Scratch']
-label_to_idx = {label: i for i, label in enumerate(FAILURE_CLASSES)}
-train_labels = np.array([label_to_idx[l] for l in train_labels])
-val_labels = np.array([label_to_idx[l] for l in val_labels])
+# failureType 문자열 -> 정수 인덱스 (FAILURE_CLASSES 순서 = 라벨 인덱스, config.py 참고)
+train_labels = np.array([LABEL_TO_IDX[l] for l in train_labels])
+val_labels = np.array([LABEL_TO_IDX[l] for l in val_labels])
 
 
 # 데이터
@@ -35,10 +33,10 @@ val_loader = DataLoader(val_ds, batch_size=128, shuffle=False, num_workers=4)
 # class weight(alpha) 없이 FocalLoss(gamma=2.0)만 사용 — sqrt-balanced alpha를 주면
 # 모델이 소수 class를 과하게 예측해 Edge-Loc/Loc 등 인접 class의 precision이 깎여 macro F1이 낮아짐
 # (alpha 제거만으로 macro F1 0.82 → 0.90+, 실험 결과는 ml/EXPERIMENT_RESULTS.md 참고)
-os.makedirs("ml/checkpoints", exist_ok=True)
+CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # 모델, 손실함수, optimizer, scheduler
-model = WaferClassifier(num_classes=9, pretrained=True).to(DEVICE)
+model = WaferClassifier(num_classes=NUM_CLASSES, pretrained=True).to(DEVICE)
 criterion = FocalLoss(alpha=None, gamma=2.0)
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
@@ -84,7 +82,7 @@ for epoch in range(50):
     # --- Early stopping + best 저장 ---
     if val_f1 > best_val_f1:
         best_val_f1 = val_f1
-        torch.save(model.state_dict(), "ml/checkpoints/best_model.pt")
+        torch.save(model.state_dict(), BEST_MODEL_PATH)
         patience_counter = 0
         print("  → Best model saved")
     else:
