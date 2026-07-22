@@ -520,6 +520,9 @@ class WaferResultGenerator:
     def __init__(self, scheduler: AnomalyScheduler, seed: int = 42):
         self.scheduler = scheduler
         self.rng = np.random.default_rng(seed)
+        # 민감도 분석용 override: {defect: correlation}. 비어 있으면 rule 기본값 사용.
+        # (frozen DEFECT_RULES를 훼손하지 않고 실험에서 correlation을 sweep하기 위함)
+        self.correlation_override: dict[str, float] = {}
 
     def generate_for_lot(
         self, route: Route, process_tick: int, wafers_per_lot: int = 25
@@ -546,7 +549,9 @@ class WaferResultGenerator:
 
             if active_defect is not None:
                 # 이상 장비를 거친 lot — equipment_correlation 확률로 defect 발현
-                corr = DEFECT_RULES[active_defect].equipment_correlation
+                corr = self.correlation_override.get(
+                    active_defect, DEFECT_RULES[active_defect].equipment_correlation
+                )
                 if self.rng.random() < corr:
                     # 진짜 인과: 이 장비가 원인
                     results.append(
@@ -670,6 +675,13 @@ class FabSimulator:
 
         # lot 카운터 (wafer-result/commonality 경로용)
         self._lot_counter = 0
+
+    def set_correlation(self, defect: str, correlation: float) -> None:
+        """민감도 분석용: 특정 defect의 equipment_correlation을 덮어쓴다.
+
+        DEFECT_RULES(frozen)를 훼손하지 않고 wafer 결과 생성에만 반영된다.
+        """
+        self.wafer_gen.correlation_override[defect] = correlation
 
     def build_schedule(self, n_lots: int, wafers_per_lot: int = 25) -> EpisodeScheduler:
         """에피소드 스케줄을 다시 만든다(더 긴 horizon이 필요할 때)."""
@@ -801,17 +813,26 @@ class CommonalityResult:
     total_pass_count: int  # 전체 wafer 중 이 장비를 거친 수
     defect_rate: float  # 이 장비를 거친 wafer의 불량률
     lift: float  # (이 장비 불량률) / (전체 불량률) — 높을수록 용의
+    p_value: float = 1.0  # Fisher's exact (경유×불량 2×2) — 낮을수록 우연 아님
 
 
 def commonality_analysis(
     wafer_results: list[WaferResult],
     top_k: int = 5,
 ) -> list[CommonalityResult]:
-    """불량 wafer들의 공통 장비를 찾는다.
+    """불량 wafer들의 공통 장비를 찾는다 (lift + Fisher's exact p-value).
 
     lift = P(defect | 이 장비 경유) / P(defect) 로 용의도를 계산.
-    lift가 1보다 크게 높으면 그 장비가 불량과 연관.
+    p_value = 2×2 분할표(경유/비경유 × 불량/정상)의 Fisher's exact —
+      lift가 "얼마나 차이 나나"(효과 크기)라면 p는 "그 차이가 우연인가"(유의성).
+      불량 표본이 희소한 영역(셀 5~20장)에서 카이제곱 근사가 부정확하므로
+      exact 검정을 쓴다(실무 YMS의 유의성 층에 대응).
+    순위는 lift 기준(기존과 동일) — p는 판정 보조 열.
     """
+    from collections import defaultdict
+
+    from scipy.stats import fisher_exact
+
     tool_total: dict[str, int] = defaultdict(int)
     tool_defect: dict[str, int] = defaultdict(int)
 
@@ -834,6 +855,10 @@ def commonality_analysis(
         d = tool_defect[tool_id]
         rate = d / total if total else 0.0
         lift = rate / base_defect_rate if base_defect_rate else 0.0
+        # 2×2 분할표: [[경유·불량, 경유·정상], [비경유·불량, 비경유·정상]]
+        a, b = d, total - d
+        c, dd = n_defect - d, (n_total - total) - (n_defect - d)
+        _, p = fisher_exact([[a, b], [c, dd]], alternative="greater")
         results.append(
             CommonalityResult(
                 tool_id=tool_id,
@@ -841,11 +866,53 @@ def commonality_analysis(
                 total_pass_count=total,
                 defect_rate=rate,
                 lift=lift,
+                p_value=float(p),
             )
         )
 
     results.sort(key=lambda x: x.lift, reverse=True)
     return results[:top_k]
+
+
+def commonality_logistic(
+    wafer_results: list[WaferResult],
+    top_k: int = 5,
+) -> list[tuple[str, float]]:
+    """로지스틱 회귀 기반 commonality — 교락(공범 장비) 통제.
+
+    lift는 장비를 하나씩 독립 채점하므로, 참 장비와 같은 lot을 거친 '공범'
+    장비들이 동률이 된다(교락). 로지스틱 회귀는 전 장비의 경유 여부를 설계
+    행렬로 동시에 넣어 "다른 장비를 통제한 뒤 남는 독립 기여"(계수)로 순위를
+    매긴다 — 공범의 계수는 0으로 죽고 참 장비만 남는 것이 기대 동작.
+    (실무 YMS의 다변량/회귀 층, 문헌의 regularized regression 계열에 대응)
+
+    반환: [(tool_id, coefficient)] 내림차순 top_k.
+    """
+    import numpy as _np
+    from sklearn.linear_model import LogisticRegression
+
+    if not wafer_results:
+        return []
+    tools = sorted({t for r in wafer_results for t in r.route.values()})
+    tool_idx = {t: i for i, t in enumerate(tools)}
+
+    X = _np.zeros((len(wafer_results), len(tools)), dtype=float)
+    y = _np.zeros(len(wafer_results), dtype=int)
+    for i, r in enumerate(wafer_results):
+        for t in r.route.values():
+            X[i, tool_idx[t]] = 1.0
+        y[i] = 1 if r.label != NORMAL_LABEL else 0
+    if y.sum() == 0 or y.sum() == len(y):
+        return []
+
+    # L2 정규화(기본): 완전 교락 시 계수를 공범들에 분산시켜 폭주를 막는다.
+    # C는 sklearn 기본(1.0) — 하이퍼파라미터 튜닝을 하지 않음(순환논리 방지:
+    # 정답을 아는 상태에서 참 장비가 이기도록 조정하면 실험이 무의미해진다).
+    model = LogisticRegression(max_iter=2000)
+    model.fit(X, y)
+    coefs = model.coef_[0]
+    order = _np.argsort(-coefs)[:top_k]
+    return [(tools[i], float(coefs[i])) for i in order]
 
 
 # ==============================================================================

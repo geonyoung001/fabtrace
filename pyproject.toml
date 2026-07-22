@@ -7,6 +7,9 @@ name = "fab-scope"
 version = "0.1.0"
 description = "WM811K wafer defect classification"
 requires-python = ">=3.10"
+# producer/ 시뮬레이터·실험이 쓰는 것만 선언한다.
+# ml/(torch, onnx 등)은 GPU/플랫폼 의존이라 여기 넣지 않고 venv에 직접 설치한다.
+dependencies = ["numpy", "scipy", "scikit-learn"]
 
 # ml 패키지를 editable(-e)로 설치하기 위한 최소 설정.
 # `pip install -e .` 후에는 실행 위치·방식과 무관하게 `import ml`이 동작한다.
