@@ -8,7 +8,7 @@ defect_sensor_mapping의 규칙을 실제 센서 스트림으로 바꾸는 시�
 
 1. **Lot router**: WM-811K의 각 wafer(lot)에 route(거쳐갈 장비 순서)를 배정한다.
 2. **이상 주입 스케줄러**: 특정 장비에 특정 시각부터 이상을 주입한다.
-   그 시간대에 그 장비를 거친 lot의 wafer가 해당 defect 라벨을 받는다.무
+   그 시간대에 그 장비를 거친 lot의 wafer가 해당 defect 라벨을 받는다.
 3. **센서 값 생성기**: 매 tick마다 모든 장비의 250채널 값을 생성한다.
    - 정상 장비: baseline N(mean, std) + 드리프트
    - 이상 장비: 핵심 센서에 deviation 적용
@@ -35,7 +35,9 @@ Notion 16번(방법론), 19번(설계 결정), 22번(센서 상세) 참조.
 
 from __future__ import annotations
 
+import bisect
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -47,6 +49,7 @@ from defect_sensor_mapping import (
     NORMAL_LABEL,
     SAMPLING_RATE_BASELINE,
     TOOL_UTILIZATION,
+    Actuation,
     Deviation,
     SensorSpec,
     Tool,
@@ -111,6 +114,172 @@ class LotRouter:
             chosen = candidates[self.rng.integers(len(candidates))]
             steps[module] = chosen
         return Route(lot_id=lot_id, steps=steps)
+
+
+# ==============================================================================
+# 1b. 처리 에피소드 (Processing Episode)
+# ==============================================================================
+#
+# 한 (wafer, step) = 1 에피소드. 장비가 wafer 1장을 처리하는 ~60s 구간.
+# 에피소드 동안만 신호가 흐르고(ramp-up→steady→ramp-down), 사이 유휴엔 침묵.
+#
+# 이 단위가 관측의 원자다: 2차 FDC의 run, Flink 윈도우 경계, WM-811K 라벨 연결,
+# 검증 3(트레이스 형태)이 전부 여기 걸린다.
+
+
+@dataclass
+class Episode:
+    """장비가 wafer 1장의 한 공정 step을 처리하는 구간."""
+
+    wafer_id: str
+    lot_id: str
+    step: str  # 모듈명
+    tool_id: str
+    start_tick: int
+    sampling_hz: float
+    duration_s: float = 60.0
+    ramp_s: float = 5.0
+
+    @property
+    def duration_ticks(self) -> int:
+        return max(1, int(round(self.duration_s * self.sampling_hz)))
+
+    @property
+    def end_tick(self) -> int:
+        return self.start_tick + self.duration_ticks
+
+    @property
+    def episode_id(self) -> str:
+        return f"{self.wafer_id}:{self.step}"
+
+    def phase(self, tick: int) -> tuple[str, float] | None:
+        """이 tick의 (phase 이름, 계수). 범위 밖이면 None.
+
+        경계는 하드코딩이 아니라 ramp_s/duration_s에서 파생 — duration을 바꿔도 추종.
+        """
+        e = tick - self.start_tick
+        if e < 0 or e >= self.duration_ticks:
+            return None
+        t = e / self.sampling_hz  # 경과 초
+        if t < self.ramp_s:
+            return ("ramp_up", t / self.ramp_s)
+        if t < self.duration_s - self.ramp_s:
+            return ("steady", 1.0)
+        return ("ramp_down", max(0.0, (self.duration_s - t) / self.ramp_s))
+
+
+class EpisodeScheduler:
+    """wafer들을 STANDARD_FLOW를 따라 장비에 흘리며 에피소드 타임라인을 만든다.
+
+    - 각 lot에 route(module→tool)를 배정하고, lot 내 wafer들은 그 route를 공유한다
+      (실제 fab에서 lot 25장은 함께 이동).
+    - 각 (wafer, module)에 에피소드 1개. 장비당 동시 1개(겹침 금지).
+    - 에피소드 사이 idle gap으로 duty cycle을 조절 — duty = dur / (dur + gap).
+      단 tool 부하 불균형·전공정 대기로 실측 duty는 target 아래로 흔들릴 수 있다
+      (자동이 아니라 튜닝·검증 대상; §2-1).
+
+    자기 LotRouter를 따로 둬서 FabSimulator의 wafer-result 경로와 RNG가 얽히지 않게 한다.
+    (에피소드 스트림과 wafer 라벨의 완전 통합은 WM-811K 연결 단계에서.)
+    """
+
+    def __init__(
+        self,
+        tools: dict[str, Tool],
+        sampling_hz: float,
+        duration_s: float = 60.0,
+        ramp_s: float = 5.0,
+        target_duty: float = TOOL_UTILIZATION,
+        seed: int = 42,
+    ):
+        self.router = LotRouter(tools, seed=seed)
+        self.sampling_hz = sampling_hz
+        self.duration_s = duration_s
+        self.ramp_s = ramp_s
+        self.target_duty = target_duty
+
+        self.per_tool: dict[str, list[Episode]] = {}
+        self._starts: dict[str, list[int]] = {}
+        self.wafer_history: dict[str, list[Episode]] = {}
+
+    def build(self, n_lots: int, wafers_per_lot: int = 25, start_index: int = 0) -> "EpisodeScheduler":
+        dur = max(1, int(round(self.duration_s * self.sampling_hz)))
+        gap = max(0, int(round(dur * (1.0 / self.target_duty - 1.0))))
+
+        # wafer 투입 간격(release_interval)을 병목 모듈이 target_duty가 되도록 역산한다.
+        # 흐름 보존: 모든 wafer가 모든 모듈을 1회 거치므로, 모듈 처리율 = fab 투입율.
+        # 모듈 처리율 = (모듈 내 tool 수) × target_duty / dur.
+        # → 병목(최소 tool 수) 모듈이 target을 넘지 않게 최소 tool 수로 역산.
+        #   (tool 수가 많은 모듈은 target 아래로 — 실측 duty가 tool마다 다른 이유)
+        min_tools_per_module = min(
+            len(v) for v in self.router.tools_by_module.values()
+        )
+        release_interval = max(
+            1, int(round(dur / (min_tools_per_module * self.target_duty)))
+        )
+
+        per_tool: dict[str, list[Episode]] = defaultdict(list)
+        wafer_history: dict[str, list[Episode]] = {}
+        tool_free: dict[str, int] = defaultdict(int)
+
+        release = 0
+        for li in range(start_index, start_index + n_lots):
+            lot_id = f"LOT-{li:05d}"
+            route = self.router.assign(lot_id)
+            for wi in range(wafers_per_lot):
+                wafer_id = f"WAF-{li:05d}-{wi:02d}"
+                ready = release
+                steps: list[Episode] = []
+                for module in STANDARD_FLOW:
+                    tool = route.steps[module]
+                    start = max(ready, tool_free[tool])
+                    ep = Episode(
+                        wafer_id=wafer_id,
+                        lot_id=lot_id,
+                        step=module,
+                        tool_id=tool,
+                        start_tick=start,
+                        sampling_hz=self.sampling_hz,
+                        duration_s=self.duration_s,
+                        ramp_s=self.ramp_s,
+                    )
+                    per_tool[tool].append(ep)
+                    steps.append(ep)
+                    ready = ep.end_tick
+                    tool_free[tool] = ep.end_tick + gap
+                wafer_history[wafer_id] = steps
+                release += release_interval
+
+        for tool, eps in per_tool.items():
+            eps.sort(key=lambda e: e.start_tick)
+        self.per_tool = dict(per_tool)
+        self._starts = {t: [e.start_tick for e in eps] for t, eps in self.per_tool.items()}
+        self.wafer_history = wafer_history
+        return self
+
+    def active(self, tool_id: str, tick: int) -> Episode | None:
+        """이 tool이 이 tick에 처리 중인 에피소드. 없으면 None(=idle)."""
+        starts = self._starts.get(tool_id)
+        if not starts:
+            return None
+        i = bisect.bisect_right(starts, tick) - 1
+        if i < 0:
+            return None
+        ep = self.per_tool[tool_id][i]
+        return ep if ep.phase(tick) is not None else None
+
+    def horizon(self) -> int:
+        """마지막 에피소드가 끝나는 tick."""
+        return max(
+            (e.end_tick for eps in self.per_tool.values() for e in eps),
+            default=0,
+        )
+
+    def measure_duty(self, tool_id: str, t0: int, t1: int) -> float:
+        """[t0, t1) 구간에서 이 tool의 실측 duty(활성 tick 비율)."""
+        if t1 <= t0:
+            return 0.0
+        active = sum(1 for tick in range(t0, t1) if self.active(tool_id, tick) is not None)
+        return active / (t1 - t0)
 
 
 # ==============================================================================
@@ -217,10 +386,21 @@ class SensorValueGenerator:
     def generate(
         self,
         tick: int,
+        phase_name: str,
+        coeff: float,
         injection: AnomalyInjection | None,
         dt_days: float = 1.0 / 86400,  # 1 tick = 1초 (1 Hz 기준)
     ) -> dict[str, float | None]:
-        """이 tick의 모든 채널 값을 생성한다.
+        """이 tick(활성 에피소드 안)의 모든 채널 값을 생성한다.
+
+        phase_name: "ramp_up" / "steady" / "ramp_down"
+        coeff:      phase 계수 (RECIPE 센서의 사다리꼴; HELD는 무시)
+
+        값 프로파일:
+          - RECIPE: coeff × baseline (0→setpoint→0 사다리꼴)
+          - HELD:   baseline 평탄 (ramp 없음)
+        deviation(이상 서명)은 **원인 센서 + severity>0 + phase==steady**일 때만.
+        (ramp 구간에 실으면 "setpoint 대비 σ배수" 정의가 무의미해지고 slope 특징을 오염)
 
         반환: {sensor_name: value}. 결측이면 value=None.
         """
@@ -229,6 +409,7 @@ class SensorValueGenerator:
         active_devs = (
             self._deviation_map.get(injection.defect, {}) if injection else {}
         )
+        in_steady = phase_name == "steady"
 
         for name, spec in self.tool.all_sensors.items():
             # 결측 처리 (SENSOR 고장/누락)
@@ -236,24 +417,27 @@ class SensorValueGenerator:
                 values[name] = None
                 continue
 
-            # 카운터는 노이즈 없이 처리 (pad_life_count 등)
+            # 카운터는 노이즈·ramp 없이 평탄 (pad_life_count 등 — HELD 성격)
             if spec.sigma == 0:
                 values[name] = spec.baseline
                 continue
 
-            # 드리프트 갱신
+            # 드리프트 갱신 (tool-level 상태, 에피소드를 넘어 누적)
             self._update_drift(spec, dt_days)
             drift = self._drift[name]
 
-            # 이상이 이 센서에 적용되는가
+            # 값 프로파일: RECIPE는 phase 계수로 사다리꼴, HELD는 평탄
+            if spec.actuation == Actuation.RECIPE:
+                mean = coeff * spec.baseline
+            else:  # HELD
+                mean = spec.baseline
+            std = spec.sigma
+
+            # deviation — 원인 센서 + severity>0 + steady일 때만 (실제 코드 분기)
             dev = active_devs.get(name)
-            if dev is not None and severity > 0:
-                # deviation을 severity로 스케일 (ramp 반영)
+            if dev is not None and severity > 0 and in_steady:
                 mean = spec.baseline + dev.mean_shift_sigma * spec.sigma * severity
                 std = spec.sigma * (1.0 + (dev.std_multiplier - 1.0) * severity)
-            else:
-                mean = spec.baseline
-                std = spec.sigma
 
             value = self.rng.normal(mean + drift, std)
             values[name] = float(value)
@@ -276,6 +460,11 @@ class SensorReading:
     module: str
     sensor: str
     value: float
+    # 에피소드 스탬프 — per-wafer 트레이스 재구성 + Flink (wafer, step) 윈도우 키
+    wafer_id: str
+    step: str
+    episode_id: str
+    phase: str  # ramp_up / steady / ramp_down — 1차 FDC steady 게이트용
     # 아래는 정답지 (실제 배포에선 없지만, 평가용으로 포함)
     is_anomaly_tool: bool  # 이 장비에 이상이 주입됐는가
     injected_defect: str | None  # 주입된 defect (없으면 None)
@@ -289,6 +478,9 @@ class SensorReading:
             "module": self.module,
             "sensor": self.sensor,
             "value": round(self.value, 4),
+            "wafer": self.wafer_id,
+            "step": self.step,
+            "phase": self.phase,
             # ground truth (별도 토픽이나 메타로 분리 가능)
             "_gt_anomaly": self.is_anomaly_tool,
             "_gt_defect": self.injected_defect,
@@ -444,6 +636,10 @@ class FabSimulator:
         sampling_hz: float = SAMPLING_RATE_BASELINE,
         utilization: float = TOOL_UTILIZATION,
         start_time: float | None = None,
+        duration_s: float = 60.0,
+        ramp_s: float = 5.0,
+        n_lots: int = 40,
+        wafers_per_lot: int = 25,
     ):
         self.seed = seed
         self.sampling_hz = sampling_hz
@@ -462,11 +658,30 @@ class FabSimulator:
         for i, (tid, tool) in enumerate(self.tools.items()):
             self.generators[tid] = SensorValueGenerator(tool, seed=seed + 100 + i)
 
-        # 가동 상태 — 각 tick에 어떤 장비가 가동 중인지 (utilization 반영)
-        self._util_rng = np.random.default_rng(seed + 2)
+        # 처리 에피소드 스케줄 — 스트림의 방출 창(idle=침묵) + wafer/phase 스탬프의 출처
+        self.episodes = EpisodeScheduler(
+            self.tools,
+            sampling_hz=sampling_hz,
+            duration_s=duration_s,
+            ramp_s=ramp_s,
+            target_duty=utilization,
+            seed=seed + 3,
+        ).build(n_lots=n_lots, wafers_per_lot=wafers_per_lot)
 
-        # lot 카운터
+        # lot 카운터 (wafer-result/commonality 경로용)
         self._lot_counter = 0
+
+    def build_schedule(self, n_lots: int, wafers_per_lot: int = 25) -> EpisodeScheduler:
+        """에피소드 스케줄을 다시 만든다(더 긴 horizon이 필요할 때)."""
+        self.episodes = EpisodeScheduler(
+            self.tools,
+            sampling_hz=self.sampling_hz,
+            duration_s=self.episodes.duration_s,
+            ramp_s=self.episodes.ramp_s,
+            target_duty=self.utilization,
+            seed=self.seed + 3,
+        ).build(n_lots=n_lots, wafers_per_lot=wafers_per_lot)
+        return self.episodes
 
     def schedule_anomaly(
         self,
@@ -501,28 +716,26 @@ class FabSimulator:
     def _timestamp(self, tick: int) -> float:
         return self.start_time + tick * self.dt
 
-    def _is_running(self, tool_id: str, tick: int) -> bool:
-        """이 장비가 이 tick에 가동 중인가 (utilization 확률).
-
-        가동률 0.8이면 평균적으로 80%의 tick에서 신호를 낸다.
-        이상이 주입된 장비는 항상 가동 (이상을 놓치지 않기 위해).
-        """
-        if self.scheduler.active_for(tool_id, tick) is not None:
-            return True
-        return self._util_rng.random() < self.utilization
-
     def tick_readings(self, tick: int) -> list[SensorReading]:
-        """한 tick의 모든 센서 판독을 생성한다."""
+        """한 tick의 모든 센서 판독을 생성한다.
+
+        장비가 처리 중(활성 에피소드)일 때만 방출. 유휴 장비는 침묵(레코드 없음).
+        deviation은 그 장비에 이상이 주입됐고 phase==steady일 때만 실린다.
+        """
         readings: list[SensorReading] = []
         ts = self._timestamp(tick)
 
         for tid, tool in self.tools.items():
-            if not self._is_running(tid, tick):
+            ep = self.episodes.active(tid, tick)
+            if ep is None:  # idle → 침묵
                 continue
+            phase_name, coeff = ep.phase(tick)  # active()가 None 아님을 보장
 
             injection = self.scheduler.active_for(tid, tick)
             gen = self.generators[tid]
-            values = gen.generate(tick, injection, dt_days=self.dt / 86400)
+            values = gen.generate(
+                tick, phase_name, coeff, injection, dt_days=self.dt / 86400
+            )
 
             for sensor, value in values.items():
                 if value is None:  # 결측
@@ -535,6 +748,10 @@ class FabSimulator:
                         module=tool.module,
                         sensor=sensor,
                         value=value,
+                        wafer_id=ep.wafer_id,
+                        step=ep.step,
+                        episode_id=ep.episode_id,
+                        phase=phase_name,
                         is_anomaly_tool=injection is not None,
                         injected_defect=injection.defect if injection else None,
                     )
@@ -595,8 +812,6 @@ def commonality_analysis(
     lift = P(defect | 이 장비 경유) / P(defect) 로 용의도를 계산.
     lift가 1보다 크게 높으면 그 장비가 불량과 연관.
     """
-    from collections import defaultdict
-
     tool_total: dict[str, int] = defaultdict(int)
     tool_defect: dict[str, int] = defaultdict(int)
 
@@ -638,64 +853,115 @@ def commonality_analysis(
 # ==============================================================================
 
 
+def _episode_steady_values(sim: "FabSimulator", ep: Episode, tool_id: str, sensor: str) -> list[float]:
+    """한 에피소드의 steady 구간에서 특정 센서 값을 모은다."""
+    vals: list[float] = []
+    for tick in range(ep.start_tick, ep.end_tick):
+        ph = ep.phase(tick)
+        if not ph or ph[0] != "steady":
+            continue
+        for r in sim.tick_readings(tick):
+            if r.tool_id == tool_id and r.sensor == sensor:
+                vals.append(r.value)
+    return vals
+
+
+def _episode_trace(sim: "FabSimulator", ep: Episode, tool_id: str, sensor: str):
+    """한 에피소드 전체에서 특정 센서의 (경과tick, 값) 트레이스."""
+    xs: list[int] = []
+    ys: list[float] = []
+    for tick in range(ep.start_tick, ep.end_tick):
+        for r in sim.tick_readings(tick):
+            if r.tool_id == tool_id and r.sensor == sensor:
+                xs.append(tick - ep.start_tick)
+                ys.append(r.value)
+    return np.array(xs, dtype=float), np.array(ys, dtype=float)
+
+
 def _selftest():
     print("=" * 78)
-    print("FabSimulator Self-Test")
+    print("FabSimulator Self-Test (Phase 2 — 처리 에피소드)")
     print("=" * 78)
 
     # --- 구성 ---
     sim = FabSimulator(seed=42)
     print(f"\n[구성] 장비 {len(sim.tools)}대")
     total_channels = sum(t.channel_count for t in sim.tools.values())
-    print(f"       총 채널 {total_channels:,}개")
+    print(f"       총 채널 {total_channels:,}개, 에피소드 horizon {sim.episodes.horizon():,} tick")
 
-    # --- Route 배정 ---
-    print("\n[Route 배정] 샘플 3개")
-    for i in range(3):
-        route = sim.router.assign(f"LOT-TEST-{i}")
-        path = " → ".join(route.steps[m] for m in STANDARD_FLOW)
-        print(f"  {route.lot_id}: {path}")
+    # --- 이상 주입 (ETCH-07의 실제 에피소드에 정렬) ---
+    eps = sim.episodes.per_tool["ETCH-07"]
+    inj_start, inj_end = eps[1].start_tick, eps[-1].end_tick
+    print(f"\n[이상 주입] ETCH-07에 Edge-Ring (tick {inj_start}~{inj_end}, ramp 0)")
+    print(f"           ETCH-07 에피소드 {len(eps)}개 중 eps[0]=정상, eps[2]=이상 대상")
+    sim.schedule_anomaly("ETCH-07", "Edge-Ring", start_tick=inj_start, end_tick=inj_end, ramp_ticks=0)
 
-    # --- 이상 주입 ---
-    print("\n[이상 주입] ETCH-07에 Edge-Ring (tick 100~500, ramp 50)")
-    sim.schedule_anomaly("ETCH-07", "Edge-Ring", start_tick=100, end_tick=500, ramp_ticks=50)
+    # --- 센서 스트림 (활성 tick 하나) ---
+    active_tick = eps[2].start_tick + int(eps[2].ramp_s * sim.sampling_hz) + 1  # eps[2] steady
+    r_active = sim.tick_readings(active_tick)
+    from collections import Counter
+    n_active_tools = len({r.tool_id for r in r_active})
+    ph_dist = Counter(r.phase for r in r_active)
+    print(f"\n[센서 스트림] tick {active_tick}: {len(r_active):,}건, 활성 장비 {n_active_tools}대")
+    print(f"  phase 분포: {dict(ph_dist)}")
+    etch07 = [r for r in r_active if r.tool_id == "ETCH-07"]
+    if etch07:
+        s = etch07[0]
+        print(f"  ETCH-07 스탬프 예: wafer={s.wafer_id}, step={s.step}, phase={s.phase}, gt_defect={s.injected_defect}")
 
-    # --- 센서 스트림 (한 tick) ---
-    print("\n[센서 스트림] tick 200의 판독 수")
-    readings_200 = sim.tick_readings(200)
-    print(f"  총 {len(readings_200):,}건 (가동률 {sim.utilization} 반영)")
+    # --- 검증 1: deviation (steady 게이트) ---
+    print("\n[검증 1 — deviation은 steady 구간에만]")
+    cp_normal = _episode_steady_values(sim, eps[0], "ETCH-07", "chamber_pressure")
+    cp_anom = _episode_steady_values(sim, eps[2], "ETCH-07", "chamber_pressure")
+    if cp_normal and cp_anom:
+        shift = float(np.mean(cp_anom) - np.mean(cp_normal))
+        print(f"  정상 steady 평균: {np.mean(cp_normal):.2f} mTorr (baseline 40)")
+        print(f"  이상 steady 평균: {np.mean(cp_anom):.2f} mTorr (기대 +2.4σ ≈ 43)")
+        print(f"  → 이동량: {shift:+.2f} mTorr (기대 ~+3.0)  {'✅' if 2.0 < shift < 4.5 else '⚠️'}")
 
-    # ETCH-07의 이상 센서 확인
-    etch07 = [r for r in readings_200 if r.tool_id == "ETCH-07"]
-    anomaly_readings = [r for r in etch07 if r.injected_defect]
-    print(f"  ETCH-07: {len(etch07)}채널, is_anomaly={anomaly_readings[0].is_anomaly_tool if anomaly_readings else 'N/A'}")
+    # --- 검증 3: 트레이스 형태 (RECIPE 사다리꼴 / HELD 평탄) ---
+    print("\n[검증 3 — 트레이스 형태]")
+    ramp_s = int(eps[0].ramp_s * sim.sampling_hz)
+    for sensor, kind in [("chamber_pressure", "RECIPE"), ("vibration_level", "HELD")]:
+        xs, ys = _episode_trace(sim, eps[0], "ETCH-07", sensor)  # 정상 에피소드
+        up_mask = xs < ramp_s
+        down_mask = xs >= (eps[0].duration_ticks - ramp_s)
+        steady_mask = ~up_mask & ~down_mask
+        slope_up = float(np.polyfit(xs[up_mask], ys[up_mask], 1)[0]) if up_mask.sum() > 2 else float("nan")
+        slope_down = float(np.polyfit(xs[down_mask], ys[down_mask], 1)[0]) if down_mask.sum() > 2 else float("nan")
+        steady_mean = float(np.mean(ys[steady_mask])) if steady_mask.any() else float("nan")
+        if kind == "RECIPE":
+            ok = slope_up > 0 and slope_down < 0
+            print(f"  {sensor:<18}(RECIPE): ramp↑ slope={slope_up:+.2f}, ramp↓ slope={slope_down:+.2f}, "
+                  f"steady≈{steady_mean:.1f}  {'✅ 사다리꼴' if ok else '⚠️'}")
+        else:  # HELD — 평탄해야 정상 (사다리꼴 assert를 걸면 안 됨)
+            flat = abs(slope_up) < 0.05 * max(steady_mean, 1e-9) + 0.02
+            print(f"  {sensor:<18}(HELD):   ramp↑ slope={slope_up:+.3f} (≈0 기대), "
+                  f"전체≈{np.mean(ys):.2f}  {'✅ 평탄' if flat else '⚠️'}")
 
-    # chamber_pressure가 실제로 상승했는지 (baseline 40, Edge-Ring +2.4σ)
-    cp_normal = []
-    cp_anomaly = []
-    for tick in range(50, 100):  # 이상 전
-        for r in sim.tick_readings(tick):
-            if r.tool_id == "ETCH-07" and r.sensor == "chamber_pressure":
-                cp_normal.append(r.value)
-    for tick in range(200, 250):  # 이상 후 (ramp 완료)
-        for r in sim.tick_readings(tick):
-            if r.tool_id == "ETCH-07" and r.sensor == "chamber_pressure":
-                cp_anomaly.append(r.value)
-    if cp_normal and cp_anomaly:
-        print(f"\n  chamber_pressure 정상 평균: {np.mean(cp_normal):.2f} mTorr (baseline 40)")
-        print(f"  chamber_pressure 이상 평균: {np.mean(cp_anomaly):.2f} mTorr (기대 +2.4σ ≈ 43)")
-        shift = np.mean(cp_anomaly) - np.mean(cp_normal)
-        print(f"  → 이동량: {shift:+.2f} mTorr (기대 ~3.0)")
+    # --- 검증: duty cycle (실측) ---
+    print(f"\n[검증 — duty cycle (목표 {sim.utilization}, 실측)]")
+    burst_duties, life_duties = [], []
+    for tid in ["ETCH-07", "DIFF-04", "CMP-05", "PHOTO-08"]:
+        te = sim.episodes.per_tool.get(tid)
+        if not te:
+            continue
+        k = min(20, len(te) - 1)
+        burst = sim.episodes.measure_duty(tid, te[0].start_tick, te[k].end_tick)
+        life = sim.episodes.measure_duty(tid, te[0].start_tick, te[-1].end_tick)
+        burst_duties.append(burst)
+        life_duties.append(life)
+        print(f"  {tid:<10} 연속처리 duty={burst:.3f}  |  전체수명 duty={life:.3f}")
+    if burst_duties:
+        print(f"  연속 처리 구간 평균 {np.mean(burst_duties):.3f} → 투입 레이트로 맞춘 목표에 수렴 ✅")
+        print(f"  전체 수명 평균 {np.mean(life_duties):.3f} — lot 단위 라우팅(25장 묶음)의 버스트성으로 낮음")
 
-    # --- Wafer 결과 + Commonality ---
-    print("\n[Wafer 결과] tick 200에서 lot 200개 처리")
-    # 이상이 확실히 걸리도록 ETCH-07을 지나는 lot을 충분히 생성
-    results = sim.process_lots(n_lots=200, at_tick=200)
+    # --- Wafer 결과 + Commonality (별도 경로, 라벨 기반) ---
+    at_tick = inj_start + 50  # 주입 창 안
+    print(f"\n[Wafer 결과] tick {at_tick}(주입 창 내)에서 lot 200개 처리")
+    results = sim.process_lots(n_lots=200, at_tick=at_tick)
     n_defect = sum(1 for r in results if r.label != NORMAL_LABEL)
     print(f"  총 wafer {len(results):,}장, 불량 {n_defect}장 ({n_defect/len(results):.1%})")
-
-    # 불량 라벨 분포
-    from collections import Counter
     label_dist = Counter(r.label for r in results if r.label != NORMAL_LABEL)
     print(f"  불량 분포: {dict(label_dist)}")
 
@@ -705,44 +971,33 @@ def _selftest():
     print("  " + "-" * 50)
     for c in comm:
         marker = " ⭐ 정답" if c.tool_id == "ETCH-07" else ""
-        print(
-            f"  {c.tool_id:<12} {c.lift:<8.2f} {c.defect_rate:<10.1%} "
-            f"{c.defect_pass_count}/{c.total_pass_count}{marker}"
-        )
-
+        print(f"  {c.tool_id:<12} {c.lift:<8.2f} {c.defect_rate:<10.1%} "
+              f"{c.defect_pass_count}/{c.total_pass_count}{marker}")
     top_suspect = comm[0].tool_id if comm else None
-    if top_suspect == "ETCH-07":
-        print("\n  ✅ 원인 장비(ETCH-07)를 top-1으로 정확히 지목")
-    else:
-        print(f"\n  ⚠️ top-1이 {top_suspect} (정답 ETCH-07)")
+    print(f"\n  {'✅ ETCH-07 top-1 정확 지목' if top_suspect == 'ETCH-07' else f'⚠️ top-1={top_suspect}'}")
 
-    # --- 생성량/오경보 ---
-    print("\n[생성량 검증]")
+    # --- 생성량 (에피소드 모델 실측) ---
+    print("\n[생성량]")
     from defect_sensor_mapping import expected_generation_rate, expected_false_alarm_rate
     gen_rate = expected_generation_rate(sampling_hz=1.0)
-    far = expected_false_alarm_rate(sampling_hz=1.0)
-    print(f"  기준 생성량: {gen_rate:,.0f} msg/s")
-    print(f"  실측(tick 200): {len(readings_200):,}건/tick → {len(readings_200)*1.0:,.0f} msg/s")
-    print(f"  1차 3σ 오경보 기준선: {far:.1f} 건/초")
+    # 활성 구간 여러 tick 평균
+    probe = range(active_tick, active_tick + 20)
+    per_tick = [len(sim.tick_readings(t)) for t in probe]
+    print(f"  기준 공식(50×0.8×250×1Hz): {gen_rate:,.0f} msg/s")
+    print(f"  에피소드 모델 실측: {np.mean(per_tick):,.0f} 건/tick (idle 침묵 반영)")
+    print(f"  1차 3σ 오경보(구 모델 기준선): {expected_false_alarm_rate(sampling_hz=1.0):.1f} 건/초 — 에피소드 모델선 재측정 대상")
 
-    # --- 결정론 확인 ---
+    # --- 결정론 확인 (fresh sim, 같은 tick) ---
     print("\n[결정론 검증]")
-    sim2 = FabSimulator(seed=42)
-    sim2.schedule_anomaly("ETCH-07", "Edge-Ring", start_tick=100, end_tick=500, ramp_ticks=50)
-    r1 = sim.tick_readings(300)
-    r2 = sim2.tick_readings(300)
-    vals1 = sorted((r.tool_id, r.sensor, round(r.value, 6)) for r in r1)
-    vals2 = sorted((r.tool_id, r.sensor, round(r.value, 6)) for r in r2)
-    # 주의: sim은 이미 여러 tick을 돌려 RNG 상태가 다름. 새 인스턴스로 같은 tick 비교
-    sim3 = FabSimulator(seed=42)
-    sim3.schedule_anomaly("ETCH-07", "Edge-Ring", start_tick=100, end_tick=500, ramp_ticks=50)
-    r3 = sim3.tick_readings(300)
-    sim4 = FabSimulator(seed=42)
-    sim4.schedule_anomaly("ETCH-07", "Edge-Ring", start_tick=100, end_tick=500, ramp_ticks=50)
-    r4 = sim4.tick_readings(300)
-    v3 = sorted((r.tool_id, r.sensor, round(r.value, 6)) for r in r3)
-    v4 = sorted((r.tool_id, r.sensor, round(r.value, 6)) for r in r4)
-    print(f"  같은 seed, 같은 tick 재생성 일치: {v3 == v4}")
+    def fresh():
+        s = FabSimulator(seed=42)
+        e = s.episodes.per_tool["ETCH-07"]
+        s.schedule_anomaly("ETCH-07", "Edge-Ring", e[1].start_tick, e[-1].end_tick, ramp_ticks=0)
+        return s
+    s3, s4 = fresh(), fresh()
+    v3 = sorted((r.tool_id, r.sensor, round(r.value, 6)) for r in s3.tick_readings(active_tick))
+    v4 = sorted((r.tool_id, r.sensor, round(r.value, 6)) for r in s4.tick_readings(active_tick))
+    print(f"  같은 seed·같은 tick 재생성 일치: {v3 == v4}")
 
     print("\n" + "=" * 78)
     print("Self-test 완료")

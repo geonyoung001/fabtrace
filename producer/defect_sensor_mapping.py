@@ -45,7 +45,7 @@ Notion 16번 문서 9~15절, 20번 실무 근거 총람 참조.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Literal
 
@@ -121,6 +121,24 @@ def sigma_from_tolerance(setpoint: float, tol_pct: float, cpk: float = CPK_TARGE
 Direction = Literal["up", "down", "spike", "unstable", "any"]
 
 
+class Actuation(str, Enum):
+    """센서 값이 처리 에피소드 안에서 어떤 모양을 그리는가.
+
+    처리 에피소드(wafer 1장 처리 ~60s)는 ramp-up→steady→ramp-down 사다리꼴이지만,
+    모든 물리량이 이 모양을 따르는 건 아니다. '언제 레코드를 방출하나'(에피소드 통일)와
+    '값이 어떤 모양이냐'(이 필드)는 별개 축이다.
+
+    - RECIPE: 레시피로 켜지는 값. 처리 중에만 존재 → 0→setpoint→0 사다리꼴.
+        RF power, 공정 가스 유량, CMP motor current, exposure_dose 등.
+    - HELD:   웨이퍼 없어도 setpoint 근방 유지되거나 장비 속성 자체.
+        확산로 존 온도, susceptor 온도, chamber wall temp, vibration_level,
+        파티클 카운터 등 → 에피소드 내내 baseline + noise 평탄 (ramp 없음).
+    """
+
+    RECIPE = "recipe"
+    HELD = "held"
+
+
 @dataclass(frozen=True)
 class SensorSpec:
     """핵심 센서 하나의 정상 상태 정의."""
@@ -132,6 +150,7 @@ class SensorSpec:
     ref: Ref  # baseline의 근거
     sigma_ref: Ref  # sigma의 근거 (별도 — 대개 등급이 다름)
     drift_per_day: float = 0.0  # 일일 드리프트 비율 (0이면 드리프트 없음)
+    actuation: Actuation = Actuation.RECIPE  # 에피소드 내 값 프로파일
 
     @property
     def cv(self) -> float:
@@ -227,6 +246,7 @@ class ChannelArchetype:
     cv_low_flow_term: float = 0.0  # 저유량 보정: cv = cv_base + term/mean
     distribution: Literal["normal", "poisson"] = "normal"
     drift_per_day: float = 0.0
+    actuation: Actuation = Actuation.RECIPE  # 이 원형의 값 프로파일
     ref: Ref = field(default_factory=lambda: Ref(Evidence.DESIGN, "설계값"))
 
     def sample_spec(self, rng: np.random.Generator, index: int) -> SensorSpec:
@@ -248,6 +268,7 @@ class ChannelArchetype:
             ref=self.ref,
             sigma_ref=self.ref,
             drift_per_day=self.drift_per_day,
+            actuation=self.actuation,
         )
 
 
@@ -258,6 +279,7 @@ CHANNEL_ARCHETYPES: dict[str, ChannelArchetype] = {
         unit="C",
         cv_base=0.003,  # 0.3%
         drift_per_day=0.002,  # 히터 열화
+        actuation=Actuation.HELD,  # 챔버/히터 온도는 상시 유지 (열질량)
         ref=Ref(
             Evidence.C,
             "US8501499 + hotplate 정밀도",
@@ -283,6 +305,7 @@ CHANNEL_ARCHETYPES: dict[str, ChannelArchetype] = {
         unit="mTorr",
         cv_base=0.015,  # 1.5%
         drift_per_day=0.003,
+        actuation=Actuation.HELD,  # base pressure는 idle에도 존재
         ref=Ref(
             Evidence.B_MINUS,
             "US8501499 TEOS OE 35~45 mTorr",
@@ -320,6 +343,7 @@ CHANNEL_ARCHETYPES: dict[str, ChannelArchetype] = {
         cv_base=0.0,  # 포아송이라 CV를 쓰지 않음
         distribution="poisson",
         drift_per_day=0.01,  # 챔버 오염 누적
+        actuation=Actuation.HELD,  # 파티클 카운터는 상시 계측
         ref=Ref(
             Evidence.B,
             "포아송 분포의 통계적 성질",
@@ -1818,9 +1842,41 @@ def build_background_channels(tool_id: str, module: str) -> dict[str, SensorSpec
     return channels
 
 
+# 핵심 센서 중 HELD(에피소드 내내 평탄)인 것들. 나머지는 RECIPE(사다리꼴)로 본다.
+#   - 상시 유지되는 열/기계 setpoint: 존/서셉터/챔버벽/베이크 온도, 전극 간격
+#   - 배스 유지값(습식): 화학농도, DHF 온도
+#   - 장비 속성 자체: vibration_level (웨이퍼 유무와 무관)
+#   - 카운터(sigma=0)는 정의상 평탄이므로 HELD로 함께 둔다
+# 등급: 개별 분류는 [C]/[DESIGN] — 물리적 성격에 근거하되 경계 사례는 관행 판단.
+HELD_CORE_SENSORS: frozenset[str] = frozenset({
+    "bake_temp",
+    "chamber_wall_temp",
+    "heater_zone_top",
+    "heater_zone_center",
+    "heater_zone_bottom",
+    "susceptor_temp_center",
+    "susceptor_temp_edge",
+    "electrode_spacing",
+    "chemical_conc",
+    "dhf_temp",
+    "vibration_level",
+    "pad_life_count",
+    "chamber_clean_cycle_count",
+})
+
+
+def _apply_core_actuation(core: dict[str, SensorSpec]) -> dict[str, SensorSpec]:
+    """핵심 센서에 actuation을 부여한다. HELD_CORE_SENSORS면 HELD, 아니면 RECIPE."""
+    out: dict[str, SensorSpec] = {}
+    for name, spec in core.items():
+        act = Actuation.HELD if name in HELD_CORE_SENSORS else Actuation.RECIPE
+        out[name] = replace(spec, actuation=act)
+    return out
+
+
 def build_tool(tool_id: str, module: str) -> Tool:
     """장비 1대를 구성한다 (핵심 센서 + 배경 채널)."""
-    core = PROCESS_BASELINES[module]
+    core = _apply_core_actuation(PROCESS_BASELINES[module])
     n_core = len(core)
     n_background_target = CHANNELS_PER_TOOL - n_core
 
@@ -1977,6 +2033,24 @@ def validate() -> list[str]:
             if spec.cv > 0.5:
                 problems.append(
                     f"{module}.{sname}: CV={spec.cv:.1%} — 너무 큼 (측정 불가능 수준)"
+                )
+
+    # (6) HELD_CORE_SENSORS의 이름이 실제 핵심 센서로 존재하는가
+    #     오타가 있으면 조용히 RECIPE로 떨어져 트레이스 형태가 잘못된다 (경고 없이).
+    all_core = {s for sensors in PROCESS_BASELINES.values() for s in sensors}
+    for sname in sorted(HELD_CORE_SENSORS - all_core):
+        problems.append(
+            f"HELD_CORE_SENSORS의 '{sname}'가 어느 모듈에도 없음 — "
+            "오타면 조용히 RECIPE(사다리꼴)로 처리됨"
+        )
+
+    # (7) 카운터(sigma=0)는 정의상 평탄 → HELD여야 한다
+    for module, sensors in PROCESS_BASELINES.items():
+        for sname, spec in sensors.items():
+            if spec.sigma == 0 and sname not in HELD_CORE_SENSORS:
+                problems.append(
+                    f"{module}.{sname}: 카운터(sigma=0)인데 HELD_CORE_SENSORS에 없음 "
+                    "— RECIPE로 잡히면 ramp 구간에서 값이 깎인다"
                 )
 
     return problems
